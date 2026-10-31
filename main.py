@@ -334,6 +334,9 @@ async def main() -> None:
         await dispatcher.start_polling(
             bot,
             allowed_updates=dispatcher.resolve_used_update_types(),
+            # События обрабатываются по порядку: исходное сообщение должно
+            # попасть в кэш до того, как обработается его редактирование.
+            handle_as_tasks=False,
         )
     finally:
         await bot.session.close()
