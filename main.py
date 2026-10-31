@@ -13,24 +13,14 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart
 from aiogram.types import BusinessConnection, BusinessMessagesDeleted, Message
 
-# Добавьте BOT_TOKEN и OWNER_ID в Replit Secrets.
+# Добавьте BOT_TOKEN в Secrets на выбранном хостинге.
 # Не вставляйте реальные значения токена прямо в этот файл.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID_VALUE = os.getenv("OWNER_ID")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN. Добавьте его в Replit Secrets.")
-
-if not OWNER_ID_VALUE:
-    raise RuntimeError("Не задан OWNER_ID. Добавьте его в Replit Secrets.")
-
-try:
-    OWNER_ID = int(OWNER_ID_VALUE)
-except ValueError as exc:
-    raise RuntimeError("OWNER_ID должен быть числовым Telegram ID.") from exc
-
-if OWNER_ID <= 0:
-    raise RuntimeError("OWNER_ID должен быть положительным числовым Telegram ID.")
+    raise RuntimeError(
+        "Не задан BOT_TOKEN. Добавьте его в Secrets выбранного хостинга."
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,8 +28,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("savemod")
 
-# Telegram присваивает message_id отдельно в каждом чате, поэтому ключ
-# содержит и chat_id — так сообщения разных личных чатов не перезапишут друг друга.
+# message_id уникален только внутри чата. Business connection также входит
+# в ключ, чтобы данные разных подключивших аккаунтов оставались раздельными.
 class MessageSnapshot(TypedDict):
     type: str
     text: str | None
@@ -49,8 +39,8 @@ class MessageSnapshot(TypedDict):
     sender_id: int | None
 
 
-message_cache: OrderedDict[tuple[int, int], MessageSnapshot] = OrderedDict()
-business_connections: dict[str, bool] = {}
+message_cache: OrderedDict[tuple[str, int, int], MessageSnapshot] = OrderedDict()
+business_connections: dict[str, int | None] = {}
 
 # Кэш остается только в RAM и ограничен, чтобы процесс не накапливал данные
 # бесконечно. При переполнении удаляются самые старые записи.
@@ -88,9 +78,13 @@ def clip_content(value: str) -> str:
     return value[: MAX_CONTENT_LENGTH - 1] + "…"
 
 
-def message_key(message: Message) -> tuple[int, int]:
-    """Возвращает уникальный для кэша ключ сообщения."""
-    return message.chat.id, message.message_id
+def message_key(message: Message) -> tuple[str, int, int]:
+    """Возвращает ключ сообщения, изолированный по Business-подключению."""
+    return (
+        message.business_connection_id or "",
+        message.chat.id,
+        message.message_id,
+    )
 
 
 def make_snapshot(message: Message) -> MessageSnapshot | None:
@@ -142,21 +136,22 @@ def describe_snapshot(snapshot: MessageSnapshot) -> str:
     return label
 
 
-async def notify_owner(
-    bot: Bot, text: str, *, parse_mode: str | None = None
+async def notify_user(
+    bot: Bot,
+    user_chat_id: int,
+    text: str,
+    *,
+    parse_mode: str | None = None,
 ) -> None:
-    """Отправляет уведомление владельцу и оставляет понятную запись в логе при ошибке."""
+    """Отправляет уведомление пользователю своего Business-подключения."""
     try:
         await bot.send_message(
-            chat_id=OWNER_ID,
+            chat_id=user_chat_id,
             text=text,
             parse_mode=parse_mode,
         )
     except TelegramAPIError:
-        logger.exception(
-            "Не удалось отправить уведомление владельцу. "
-            "Убедитесь, что владелец открыл бота и нажал /start."
-        )
+        logger.exception("Не удалось отправить уведомление владельцу подключения.")
 
 
 def format_sender(snapshot: MessageSnapshot | None) -> str:
@@ -178,12 +173,16 @@ def format_sender(snapshot: MessageSnapshot | None) -> str:
     return sender_label
 
 
-def format_deleted_notification(snapshot: MessageSnapshot | None) -> str:
+def format_deleted_notification(
+    snapshot: MessageSnapshot | None,
+    message_id: int,
+) -> str:
     """Собирает компактное HTML-уведомление с автором и содержимым."""
     if snapshot is None:
         return (
             "🗑 <b>Сообщение удалено</b>\n"
             "👤 <b>Автор:</b> неизвестен\n"
+            f"🆔 <code>{message_id}</code>\n"
             "📝 <i>Содержимое неизвестно</i>"
         )
 
@@ -191,6 +190,7 @@ def format_deleted_notification(snapshot: MessageSnapshot | None) -> str:
     return (
         "🗑 <b>Сообщение удалено</b>\n"
         f"👤 <b>Автор:</b> {format_sender(snapshot)}\n"
+        f"🆔 <code>{message_id}</code>\n"
         f"<blockquote>{content}</blockquote>"
     )
 
@@ -198,6 +198,7 @@ def format_deleted_notification(snapshot: MessageSnapshot | None) -> str:
 def format_edited_notification(
     previous: MessageSnapshot | None,
     current: MessageSnapshot,
+    message_id: int,
 ) -> str:
     """Показывает автора и значения до/после редактирования."""
     sender = format_sender(current)
@@ -211,6 +212,7 @@ def format_edited_notification(
     return (
         "✏️ <b>Сообщение изменено</b>\n"
         f"👤 <b>Автор:</b> {sender}\n"
+        f"🆔 <code>{message_id}</code>\n"
         "<blockquote>"
         f"<b>Было:</b> {html.escape(old_content)}\n"
         f"<b>Стало:</b> {html.escape(new_content)}"
@@ -218,8 +220,10 @@ def format_edited_notification(
     )
 
 
-async def is_owner_connection(bot: Bot, connection_id: str) -> bool:
-    """Проверяет, что Business-подключение принадлежит заданному владельцу."""
+async def get_connection_user_chat_id(
+    bot: Bot, connection_id: str
+) -> int | None:
+    """Получает чат пользователя, который явно подключил Business-аккаунт."""
     if connection_id in business_connections:
         return business_connections[connection_id]
 
@@ -231,11 +235,13 @@ async def is_owner_connection(bot: Bot, connection_id: str) -> bool:
         )
     except TelegramAPIError:
         logger.exception("Не удалось проверить Business-подключение.")
-        return False
+        return None
 
-    is_owner = connection.user.id == OWNER_ID and connection.is_enabled
-    business_connections[connection_id] = is_owner
-    return is_owner
+    user_chat_id = (
+        connection.user_chat_id if connection.is_enabled else None
+    )
+    business_connections[connection_id] = user_chat_id
+    return user_chat_id
 
 
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
@@ -247,6 +253,8 @@ async def start_handler(message: Message) -> None:
         "к своему Telegram Business-аккаунту.\n\n"
         "После подключения я буду присылать уведомления об изменённых "
         "и удалённых сообщениях в личных чатах.\n\n"
+        "Уведомления получает только пользователь, подключивший свой аккаунт. "
+        "Текст и подписи временно хранятся в RAM; медиа не скачиваются.\n\n"
         "Кэш временный: он хранится только в памяти и очищается "
         "при перезапуске бота."
     )
@@ -256,27 +264,31 @@ async def start_handler(message: Message) -> None:
 async def business_connection_handler(
     connection: BusinessConnection, bot: Bot
 ) -> None:
-    """Запоминает ID только Business-подключения заданного владельца."""
-    if connection.user.id != OWNER_ID:
-        logger.info("Пропущено Business-подключение другого аккаунта.")
-        return
-
-    was_enabled = business_connections.get(connection.id, False)
-    business_connections[connection.id] = connection.is_enabled
-
-    if connection.is_enabled and not was_enabled:
-        await notify_owner(bot, "✅ Бот подключён")
-    elif not connection.is_enabled:
-        logger.info("Business-подключение владельца отключено.")
+    """Регистрирует отдельное подключение каждого пользователя."""
+    was_enabled = business_connections.get(connection.id) is not None
+    if connection.is_enabled:
+        business_connections[connection.id] = connection.user_chat_id
+        if not was_enabled:
+            await notify_user(
+                bot,
+                connection.user_chat_id,
+                "✅ Бот подключён",
+            )
+    else:
+        business_connections[connection.id] = None
+        for key in list(message_cache):
+            if key[0] == connection.id:
+                del message_cache[key]
+        logger.info("Пользователь отключил Business-подключение.")
 
 
 @router.business_message()
 async def business_message_handler(message: Message, bot: Bot) -> None:
-    """Кэширует поддерживаемые сообщения только из личных чатов владельца."""
+    """Кэширует поддерживаемые сообщения подключённого пользователя."""
     if message.chat.type != ChatType.PRIVATE or not message.business_connection_id:
         return
 
-    if not await is_owner_connection(bot, message.business_connection_id):
+    if await get_connection_user_chat_id(bot, message.business_connection_id) is None:
         return
 
     cache_message(message)
@@ -284,11 +296,14 @@ async def business_message_handler(message: Message, bot: Bot) -> None:
 
 @router.edited_business_message()
 async def edited_business_message_handler(message: Message, bot: Bot) -> None:
-    """Сообщает владельцу прежнее и текущее содержимое отредактированного сообщения."""
+    """Сообщает подключившемуся пользователю прежнее и текущее содержимое."""
     if message.chat.type != ChatType.PRIVATE or not message.business_connection_id:
         return
 
-    if not await is_owner_connection(bot, message.business_connection_id):
+    user_chat_id = await get_connection_user_chat_id(
+        bot, message.business_connection_id
+    )
+    if user_chat_id is None:
         return
 
     key = message_key(message)
@@ -297,9 +312,10 @@ async def edited_business_message_handler(message: Message, bot: Bot) -> None:
     if current is None:
         return
 
-    await notify_owner(
+    await notify_user(
         bot,
-        format_edited_notification(previous, current),
+        user_chat_id,
+        format_edited_notification(previous, current, message.message_id),
         parse_mode="HTML",
     )
 
@@ -308,18 +324,23 @@ async def edited_business_message_handler(message: Message, bot: Bot) -> None:
 async def deleted_business_messages_handler(
     update: BusinessMessagesDeleted, bot: Bot
 ) -> None:
-    """Отправляет уведомление для каждого удалённого сообщения из личного чата."""
+    """Отправляет уведомление владельцу подключения для каждого удаления."""
     if update.chat.type != ChatType.PRIVATE:
         return
 
-    if not await is_owner_connection(bot, update.business_connection_id):
+    user_chat_id = await get_connection_user_chat_id(
+        bot, update.business_connection_id
+    )
+    if user_chat_id is None:
         return
 
     for message_id in update.message_ids:
-        snapshot = message_cache.pop((update.chat.id, message_id), None)
-        await notify_owner(
+        key = (update.business_connection_id, update.chat.id, message_id)
+        snapshot = message_cache.pop(key, None)
+        await notify_user(
             bot,
-            format_deleted_notification(snapshot),
+            user_chat_id,
+            format_deleted_notification(snapshot, message_id),
             parse_mode="HTML",
         )
 
