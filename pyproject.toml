@@ -1,0 +1,15 @@
+[project]
+name = "savemod-bot"
+version = "0.1.0"
+description = "Telegram Business bot for edit and deletion notifications."
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.7",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = false
