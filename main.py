@@ -159,15 +159,10 @@ async def notify_owner(
         )
 
 
-def format_deleted_notification(snapshot: MessageSnapshot | None) -> str:
-    """Собирает компактное HTML-уведомление с автором и содержимым."""
+def format_sender(snapshot: MessageSnapshot | None) -> str:
+    """Формирует безопасную HTML-ссылку на автора сообщения."""
     if snapshot is None:
-        return (
-            "🗑 <b>Сообщение удалено</b>\n"
-            "👤 <b>Отправитель:</b> неизвестен\n"
-            "📝 <i>Содержимое неизвестно</i>"
-        )
-
+        return "неизвестен"
     sender_name = snapshot["sender_name"] or "неизвестен"
     escaped_name = html.escape(sender_name)
     sender_id = snapshot["sender_id"]
@@ -180,11 +175,46 @@ def format_deleted_notification(snapshot: MessageSnapshot | None) -> str:
     if username:
         sender_label += f" · @{html.escape(username)}"
 
+    return sender_label
+
+
+def format_deleted_notification(snapshot: MessageSnapshot | None) -> str:
+    """Собирает компактное HTML-уведомление с автором и содержимым."""
+    if snapshot is None:
+        return (
+            "🗑 <b>Сообщение удалено</b>\n"
+            "👤 <b>Автор:</b> неизвестен\n"
+            "📝 <i>Содержимое неизвестно</i>"
+        )
+
     content = html.escape(describe_snapshot(snapshot))
     return (
         "🗑 <b>Сообщение удалено</b>\n"
-        f"👤 <b>Отправитель:</b> {sender_label}\n"
+        f"👤 <b>Автор:</b> {format_sender(snapshot)}\n"
         f"<blockquote>{content}</blockquote>"
+    )
+
+
+def format_edited_notification(
+    previous: MessageSnapshot | None,
+    current: MessageSnapshot,
+) -> str:
+    """Показывает автора и значения до/после редактирования."""
+    sender = format_sender(current)
+    if sender == "неизвестен" and previous is not None:
+        sender = format_sender(previous)
+
+    old_content = (
+        describe_snapshot(previous) if previous else "содержимое неизвестно"
+    )
+    new_content = describe_snapshot(current)
+    return (
+        "✏️ <b>Сообщение изменено</b>\n"
+        f"👤 <b>Автор:</b> {sender}\n"
+        "<blockquote>"
+        f"<b>Было:</b> {html.escape(old_content)}\n"
+        f"<b>Стало:</b> {html.escape(new_content)}"
+        "</blockquote>"
     )
 
 
@@ -267,13 +297,10 @@ async def edited_business_message_handler(message: Message, bot: Bot) -> None:
     if current is None:
         return
 
-    previous_text = (
-        describe_snapshot(previous) if previous else "содержимое неизвестно"
-    )
-    current_text = describe_snapshot(current)
     await notify_owner(
         bot,
-        f"✏️ Отредактировано: было «{previous_text}», стало «{current_text}»",
+        format_edited_notification(previous, current),
+        parse_mode="HTML",
     )
 
 
