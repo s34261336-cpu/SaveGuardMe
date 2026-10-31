@@ -1,6 +1,7 @@
 """SaveMod — уведомления об изменении и удалении Business-сообщений."""
 
 import asyncio
+import html
 import logging
 import os
 from collections import OrderedDict
@@ -43,6 +44,9 @@ class MessageSnapshot(TypedDict):
     type: str
     text: str | None
     caption: str | None
+    sender_name: str | None
+    sender_username: str | None
+    sender_id: int | None
 
 
 message_cache: OrderedDict[tuple[int, int], MessageSnapshot] = OrderedDict()
@@ -90,15 +94,22 @@ def message_key(message: Message) -> tuple[int, int]:
 
 
 def make_snapshot(message: Message) -> MessageSnapshot | None:
-    """Сохраняет только тип, текст и подпись; файлы медиа не скачиваются."""
+    """Сохраняет тип, текст, подпись и автора; медиафайлы не скачиваются."""
     message_type = str(getattr(message.content_type, "value", message.content_type))
     if message_type not in SUPPORTED_TYPES:
         return None
+
+    # Для обычных сообщений используем автора, а для сообщений от другого
+    # Business-бота — sender_business_bot, если он присутствует.
+    sender = message.from_user or getattr(message, "sender_business_bot", None)
 
     return {
         "type": message_type,
         "text": message.text if message_type == "text" else None,
         "caption": message.caption,
+        "sender_name": sender.full_name if sender else None,
+        "sender_username": sender.username if sender else None,
+        "sender_id": sender.id if sender else None,
     }
 
 
@@ -131,15 +142,50 @@ def describe_snapshot(snapshot: MessageSnapshot) -> str:
     return label
 
 
-async def notify_owner(bot: Bot, text: str) -> None:
+async def notify_owner(
+    bot: Bot, text: str, *, parse_mode: str | None = None
+) -> None:
     """Отправляет уведомление владельцу и оставляет понятную запись в логе при ошибке."""
     try:
-        await bot.send_message(chat_id=OWNER_ID, text=text)
+        await bot.send_message(
+            chat_id=OWNER_ID,
+            text=text,
+            parse_mode=parse_mode,
+        )
     except TelegramAPIError:
         logger.exception(
             "Не удалось отправить уведомление владельцу. "
             "Убедитесь, что владелец открыл бота и нажал /start."
         )
+
+
+def format_deleted_notification(snapshot: MessageSnapshot | None) -> str:
+    """Собирает компактное HTML-уведомление с автором и содержимым."""
+    if snapshot is None:
+        return (
+            "🗑 <b>Сообщение удалено</b>\n"
+            "👤 <b>Отправитель:</b> неизвестен\n"
+            "📝 <i>Содержимое неизвестно</i>"
+        )
+
+    sender_name = snapshot["sender_name"] or "неизвестен"
+    escaped_name = html.escape(sender_name)
+    sender_id = snapshot["sender_id"]
+    if sender_id:
+        sender_label = f'<a href="tg://user?id={sender_id}">{escaped_name}</a>'
+    else:
+        sender_label = escaped_name
+
+    username = snapshot["sender_username"]
+    if username:
+        sender_label += f" · @{html.escape(username)}"
+
+    content = html.escape(describe_snapshot(snapshot))
+    return (
+        "🗑 <b>Сообщение удалено</b>\n"
+        f"👤 <b>Отправитель:</b> {sender_label}\n"
+        f"<blockquote>{content}</blockquote>"
+    )
 
 
 async def is_owner_connection(bot: Bot, connection_id: str) -> bool:
@@ -244,15 +290,11 @@ async def deleted_business_messages_handler(
 
     for message_id in update.message_ids:
         snapshot = message_cache.pop((update.chat.id, message_id), None)
-        if snapshot is None:
-            await notify_owner(bot, "🗑 Удалено (содержимое неизвестно)")
-            continue
-
-        description = describe_snapshot(snapshot)
-        if snapshot["type"] == "text":
-            await notify_owner(bot, f"🗑 Удалено: «{description}»")
-        else:
-            await notify_owner(bot, f"🗑 Удалено: {description}")
+        await notify_owner(
+            bot,
+            format_deleted_notification(snapshot),
+            parse_mode="HTML",
+        )
 
 
 async def main() -> None:
